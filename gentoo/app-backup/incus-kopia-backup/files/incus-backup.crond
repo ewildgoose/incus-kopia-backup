@@ -1,0 +1,5 @@
+# incus-kopia-backup: start due container backups. The scheduler exits at once
+# when another scheduler is running, so overlapping runs are harmless.
+# Failures are printed, so cron mails them to MAILTO/root.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+*/15 * * * * root /usr/sbin/incus-backup-scheduler

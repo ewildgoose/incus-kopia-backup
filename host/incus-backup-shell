@@ -1,0 +1,55 @@
+#!/bin/bash
+# incus-backup-shell INSTANCE [COMMAND [ARGS...]]
+#
+# Run a shell (default) or a command inside a running instance with Kopia
+# injected and connected as the instance's backup identity. Use it for
+# restores and inspection, for example:
+#   incus-backup-shell www11                      # interactive shell
+#   incus-backup-shell www11 kopia snapshot list  # one command
+# Inside the shell, "kopia" resolves to the injected binary and is already
+# connected. Everything injected is removed when the shell exits.
+set -euo pipefail
+# shellcheck source=lib/common.sh
+source /usr/lib/incus-backup/common.sh
+ib_load_config
+ib_detect_cli
+
+INSTANCE="${1:?Usage: $0 <instance> [command...]}"
+shift
+INSTANCE_JSON="$(ib_instance_json "${INSTANCE}")"
+[[ "$(jq -r '.status // empty' <<<"${INSTANCE_JSON}")" == Running ]] || ib_die "${INSTANCE} is not running"
+IDENTITY="$(ib_identity "${INSTANCE_JSON}")" || ib_die "${INSTANCE}: user.backup.hostname is not set"
+CREDENTIAL_FILE="${CREDENTIAL_DIR}/${IDENTITY}"
+[[ -r "${CREDENTIAL_FILE}" ]] || ib_die "${CREDENTIAL_FILE} is missing; run: incus-backup-provision ${INSTANCE}"
+RT="$(ib_cfg "${INSTANCE_JSON}" user.backup.runtime_dir "${REMOTE_RUNTIME_DIR}")"
+[[ "${RT}" =~ ^/[A-Za-z0-9_./-]+$ && "${RT}" != / ]] || ib_die "invalid runtime dir '${RT}'"
+
+guest() { "${CLI}" exec --force-noninteractive "${INSTANCE}" -- "$@"; }
+cleanup() { guest rm -rf "${RT}" >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+
+guest rm -rf "${RT}"
+guest sh -c 'mkdir -p "$1" && chmod 0700 "$1"' sh "${RT}"
+"${CLI}" file push --quiet --mode 0700 --uid 0 --gid 0 "${KOPIA_BIN}" "${INSTANCE}${RT}/kopia"
+"${CLI}" file push --quiet --mode 0600 --uid 0 --gid 0 "${CREDENTIAL_FILE}" "${INSTANCE}${RT}/password"
+
+# Credentials are persisted to a file next to the config inside RT (no keyring
+# in a container), so plain "kopia" works in the shell. RT is removed on exit.
+guest sh -c '
+    set -eu
+    KOPIA_PASSWORD="$(cat "$1/password")"; export KOPIA_PASSWORD
+    mkdir -p "$5/logs"
+    "$1/kopia" --config-file="$1/repository.config" --no-use-keyring --log-dir="$5/logs" \
+        repository connect server \
+        --url="$2" --server-cert-fingerprint="$3" \
+        --override-username=backup --override-hostname="$4" \
+        --cache-directory="$5" --no-check-for-updates
+    rm -f "$1/password"
+' sh "${RT}" "${KOPIA_SERVER_URL}" "${KOPIA_SERVER_FINGERPRINT}" "${IDENTITY}" "${REMOTE_CACHE_DIR}"
+
+echo "Connected as backup@${IDENTITY}. The injected files are removed when you exit." >&2
+"${CLI}" exec "${INSTANCE}" \
+    --env "KOPIA_CONFIG_PATH=${RT}/repository.config" \
+    --env "KOPIA_LOG_DIR=${REMOTE_CACHE_DIR}/logs" \
+    --env "PATH=${RT}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    -- "${@:-sh}" || true

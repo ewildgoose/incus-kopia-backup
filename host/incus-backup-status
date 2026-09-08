@@ -1,0 +1,69 @@
+#!/bin/bash
+# incus-backup-status [--server]
+#
+# Show the backup state of every instance on this host from the local state
+# directory. With --server, also list the newest snapshot per source as seen by
+# the Kopia server (needs the trusted-host admin identity with READ on
+# type=snapshot, as created by kopia-server-add-host).
+set -euo pipefail
+# shellcheck source=lib/common.sh
+source /usr/lib/incus-backup/common.sh
+ib_load_config
+ib_detect_cli
+
+SHOW_SERVER=false
+[[ "${1:-}" == --server ]] && SHOW_SERVER=true
+NOW="$(date +%s)"
+
+age_str() {
+    local s=$1
+    if (( s >= 86400 )); then printf '%dd%dh' $((s / 86400)) $(((s % 86400) / 3600))
+    elif (( s >= 3600 )); then printf '%dh%dm' $((s / 3600)) $(((s % 3600) / 60))
+    else printf '%dm' $((s / 60)); fi
+}
+
+{
+    printf 'INSTANCE\tSTATUS\tENABLED\tIDENTITY\tINTERVAL\tLAST_SUCCESS\tAGE\tDUE\tLAST_RESULT\n'
+    "${CLI}" query "/1.0/instances?recursion=1" | jq -r '
+        .[] | [.name, .status,
+               (.expanded_config["user.backup.enabled"] // "-"),
+               (.expanded_config["user.backup.hostname"] // "-"),
+               (.expanded_config["user.backup.interval"] // "")] | @tsv' \
+    | while IFS=$'\t' read -r name status enabled identity interval; do
+        [[ -n "${interval}" ]] || interval="${DEFAULT_INTERVAL}"
+        secs="$(ib_interval_seconds "${interval}" || echo 0)"
+        d="${STATE_DIR}/${name}"
+        last="never"; age="-"; due="-"; result="-"
+        if [[ -r "${d}/last_success" ]]; then
+            ls="$(<"${d}/last_success")"
+            last="$(date -d "@${ls}" '+%Y-%m-%d %H:%M')"
+            age="$(age_str $((NOW - ls)))"
+            if (( NOW - ls >= secs )); then due=yes; else due=no; fi
+        elif ib_is_true "${enabled}"; then
+            due=yes
+        fi
+        [[ -r "${d}/last_result" ]] && result="$(<"${d}/last_result")"
+        if [[ "${status}" != Running ]]; then due="-"; fi
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "${name}" "${status}" "${enabled}" "${identity}" "${interval}" "${last}" "${age}" "${due}" "${result}"
+    done
+} | column -t -s $'\t'
+
+if [[ "${SHOW_SERVER}" == true ]]; then
+    ib_read_admin_password
+    ib_admin_connect
+    echo
+    echo "Newest snapshot per source on ${KOPIA_SERVER_URL}:"
+    {
+        printf 'SOURCE\tSTART\tFILES\tSIZE\tERRORS\tPINS\n'
+        kopia_admin snapshot list --all --json --max-results=1 | jq -r '
+            .[] | select(.source.userName == "backup")
+            | [ "\(.source.userName)@\(.source.host):\(.source.path)",
+                (.startTime | sub("\\.[0-9]+"; "") | sub("Z$"; "")),
+                (.rootEntry.summ.files // 0),
+                (((.rootEntry.summ.size // 0) / 1048576) | floor | tostring) + "MB",
+                (.stats.errorCount // 0),
+                ((.pins // []) | join(",")) ]
+            | @tsv'
+    } | column -t -s $'\t'
+fi

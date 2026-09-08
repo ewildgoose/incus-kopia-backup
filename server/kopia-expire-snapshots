@@ -1,0 +1,8 @@
+#!/bin/bash
+# kopia-expire-snapshots
+# Apply the retention policies to every source and delete expired snapshots.
+# The server also applies retention to a source after each client snapshot;
+# this run covers sources that have stopped sending snapshots. Pinned
+# snapshots (see kopia-pin-guard) are never expired.
+set -euo pipefail
+exec kopia-admin snapshot expire --all --delete

@@ -1,0 +1,18 @@
+#!/bin/bash
+# kopia-admin KOPIA-ARGUMENTS...
+#
+# Run kopia against the local repository with full (direct, non-server)
+# access. Reads the repository password from KOPIA_PASSWORD_FILE.
+# Examples:
+#   kopia-admin snapshot list --all
+#   kopia-admin server acl list
+#   kopia-admin policy show 'backup@www11.nippynetworks.com:/'
+set -euo pipefail
+: "${KOPIA_BIN:=/usr/bin/kopia}"
+: "${KOPIA_CONFIG:=/etc/kopia/repository.config}"
+: "${KOPIA_PASSWORD_FILE:=/etc/kopia/repository.password}"
+: "${KOPIA_LOG_DIR:=/var/log/kopia/admin}"
+[[ -r "${KOPIA_CONFIG}" ]] || { echo "kopia-admin: cannot read ${KOPIA_CONFIG}" >&2; exit 1; }
+[[ -r "${KOPIA_PASSWORD_FILE}" ]] || { echo "kopia-admin: cannot read ${KOPIA_PASSWORD_FILE}" >&2; exit 1; }
+export KOPIA_LOG_DIR KOPIA_CHECK_FOR_UPDATES=false
+KOPIA_PASSWORD="$(<"${KOPIA_PASSWORD_FILE}")" exec "${KOPIA_BIN}" --config-file="${KOPIA_CONFIG}" "$@"

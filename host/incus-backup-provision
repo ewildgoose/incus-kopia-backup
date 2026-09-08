@@ -1,0 +1,171 @@
+#!/bin/bash
+# incus-backup-provision [--reset-password] INSTANCE
+#
+# Idempotently prepare an instance for backup:
+#   1. create or keep the backup@<identity> user on the Kopia server;
+#   2. keep its password in CREDENTIAL_DIR on this host;
+#   3. discover the sources (root and attached custom volumes);
+#   4. write the Kopia policy for every source from its policy class file,
+#      plus the ad-hoc user.backup.exclude* rules.
+# Re-run after any user.backup.* change. Passwords are only rotated with
+# --reset-password.
+set -euo pipefail
+# shellcheck source=lib/common.sh
+source /usr/lib/incus-backup/common.sh
+ib_load_config
+ib_detect_cli
+
+usage() { echo "Usage: $0 [--reset-password] <instance>" >&2; }
+RESET_PASSWORD=false
+while [[ $# -gt 0 && "$1" == --* ]]; do
+    case "$1" in
+        --reset-password) RESET_PASSWORD=true ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage; ib_die "unknown option $1" ;;
+    esac
+    shift
+done
+INSTANCE="${1:-}"
+[[ -n "${INSTANCE}" ]] || { usage; exit 1; }
+
+INSTANCE_JSON="$(ib_instance_json "${INSTANCE}")"
+IDENTITY="$(ib_identity "${INSTANCE_JSON}")" || ib_die "${INSTANCE}: user.backup.hostname is not set"
+BACKUP_USER="backup@${IDENTITY}"
+BACKUP_PASSWORD_FILE="${CREDENTIAL_DIR}/${IDENTITY}"
+GENERIC_EXCLUDES="$(ib_cfg "${INSTANCE_JSON}" user.backup.exclude)"
+ROOT_EXCLUDES="$(ib_cfg "${INSTANCE_JSON}" user.backup.exclude.root)"
+DATA_EXCLUDES="$(ib_cfg "${INSTANCE_JSON}" user.backup.exclude.data)"
+
+mapfile -t SOURCES < <(ib_sources "${INSTANCE_JSON}")
+(( ${#SOURCES[@]} > 0 )) || ib_die "${INSTANCE}: no sources selected (user.backup.root=false and no custom volumes)"
+for row in "${SOURCES[@]}"; do
+    IFS=$'\t' read -r kind path class dev <<<"${row}"
+    [[ "${class}" =~ ^[A-Za-z0-9_-]+$ && -r "${POLICY_DIR}/${class}.conf" ]] \
+        || ib_die "unknown policy class '${class}': ${POLICY_DIR}/${class}.conf does not exist"
+done
+
+install -d -m 0700 "$(dirname "${CREDENTIAL_DIR}")" "${CREDENTIAL_DIR}"
+install -d -m 0750 "${LOG_DIR}" "${LOG_DIR}/kopia"
+ib_read_admin_password
+ib_admin_connect
+echo "Connected to ${KOPIA_SERVER_URL} as ${KOPIA_ADMIN_USERNAME}@${KOPIA_ADMIN_HOSTNAME}"
+
+# --- backup user and password ---------------------------------------------
+USER_EXISTS=false
+if kopia_admin server users info "${BACKUP_USER}" >/dev/null 2>&1; then
+    USER_EXISTS=true
+fi
+
+PASSWORD_CHANGED=false
+if [[ "${RESET_PASSWORD}" == true || ! -r "${BACKUP_PASSWORD_FILE}" ]]; then
+    if [[ "${USER_EXISTS}" == true && "${RESET_PASSWORD}" != true ]]; then
+        ib_die "${BACKUP_USER} exists on the server but ${BACKUP_PASSWORD_FILE} is missing. Re-run with --reset-password to rotate the password deliberately."
+    fi
+    NEW_PASSWORD="$(openssl rand -base64 48 | tr -d '\n')"
+    (umask 077; printf '%s\n' "${NEW_PASSWORD}" >"${BACKUP_PASSWORD_FILE}.tmp")
+    if [[ "${USER_EXISTS}" == true ]]; then
+        echo "Rotating password of ${BACKUP_USER}"
+        kopia_admin server users set "${BACKUP_USER}" --user-password="${NEW_PASSWORD}"
+    else
+        echo "Creating ${BACKUP_USER}"
+        kopia_admin server users add "${BACKUP_USER}" --user-password="${NEW_PASSWORD}"
+    fi
+    mv -f "${BACKUP_PASSWORD_FILE}.tmp" "${BACKUP_PASSWORD_FILE}"
+    PASSWORD_CHANGED=true
+elif [[ "${USER_EXISTS}" != true ]]; then
+    echo "Creating ${BACKUP_USER} with the existing password from ${BACKUP_PASSWORD_FILE}"
+    kopia_admin server users add "${BACKUP_USER}" --user-password="$(<"${BACKUP_PASSWORD_FILE}")"
+    PASSWORD_CHANGED=true
+fi
+chmod 0600 "${BACKUP_PASSWORD_FILE}"
+
+# Confirm the server accepts the credential. After a change the server needs
+# one refresh cycle (--refresh-interval, or SIGHUP) before it sees the user.
+verify_backup_user() {
+    local tmp deadline
+    tmp="$(mktemp -d)"
+    deadline=$(( $(date +%s) + $1 ))
+    while :; do
+        if KOPIA_PASSWORD="$(<"${BACKUP_PASSWORD_FILE}")" "${KOPIA_BIN}" \
+                --config-file="${tmp}/repository.config" --no-persist-credentials \
+                repository connect server \
+                --url="${KOPIA_SERVER_URL}" \
+                --server-cert-fingerprint="${KOPIA_SERVER_FINGERPRINT}" \
+                --override-username=backup --override-hostname="${IDENTITY}" \
+                --cache-directory="${tmp}/cache" \
+                --no-check-for-updates >/dev/null 2>"${tmp}/err"; then
+            rm -rf "${tmp}"
+            return 0
+        fi
+        if (( $(date +%s) >= deadline )); then
+            cat "${tmp}/err" >&2
+            rm -rf "${tmp}"
+            return 1
+        fi
+        sleep 5
+    done
+}
+if [[ "${PASSWORD_CHANGED}" == true ]]; then
+    echo "Waiting up to ${PROVISION_AUTH_TIMEOUT}s for the server to accept ${BACKUP_USER}..."
+    if verify_backup_user "${PROVISION_AUTH_TIMEOUT}"; then
+        echo "Server accepts ${BACKUP_USER}"
+    else
+        ib_warn "server does not accept ${BACKUP_USER} yet. Run 'rc-service kopia-server reload' on the server, or wait for its refresh interval, then retry the backup."
+    fi
+else
+    verify_backup_user 0 || ib_die "server rejects the password in ${BACKUP_PASSWORD_FILE} for ${BACKUP_USER}. Re-run with --reset-password if the file is stale."
+fi
+
+# --- policies ---------------------------------------------------------------
+split_list() {
+    tr ',' '\n' <<<"$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' || true
+}
+
+apply_policy() {
+    local class="$1" target="$2"
+    shift 2
+    local IGNORE=() ONE_FILE_SYSTEM="" IGNORE_CACHE_DIRS="" COMPRESSION=""
+    local KEEP_LATEST="" KEEP_HOURLY="" KEEP_DAILY="" KEEP_WEEKLY="" KEEP_MONTHLY="" KEEP_ANNUAL=""
+    local p extra
+    # shellcheck disable=SC1090
+    source "${POLICY_DIR}/${class}.conf"
+
+    local args=(policy set "${target}" --clear-ignore --clear-dot-ignore)
+    for p in "${IGNORE[@]}"; do args+=(--add-ignore "${p}"); done
+    for extra in "$@"; do
+        while IFS= read -r p; do args+=(--add-ignore "${p}"); done < <(split_list "${extra}")
+    done
+    if [[ -n "${ONE_FILE_SYSTEM}" ]]; then args+=(--one-file-system="${ONE_FILE_SYSTEM}"); fi
+    if [[ -n "${IGNORE_CACHE_DIRS}" ]]; then args+=(--ignore-cache-dirs="${IGNORE_CACHE_DIRS}"); fi
+    if [[ -n "${KEEP_LATEST}" ]]; then args+=(--keep-latest="${KEEP_LATEST}"); fi
+    if [[ -n "${KEEP_HOURLY}" ]]; then args+=(--keep-hourly="${KEEP_HOURLY}"); fi
+    if [[ -n "${KEEP_DAILY}" ]]; then args+=(--keep-daily="${KEEP_DAILY}"); fi
+    if [[ -n "${KEEP_WEEKLY}" ]]; then args+=(--keep-weekly="${KEEP_WEEKLY}"); fi
+    if [[ -n "${KEEP_MONTHLY}" ]]; then args+=(--keep-monthly="${KEEP_MONTHLY}"); fi
+    if [[ -n "${KEEP_ANNUAL}" ]]; then args+=(--keep-annual="${KEEP_ANNUAL}"); fi
+    if [[ -n "${COMPRESSION}" ]]; then args+=(--compression="${COMPRESSION}"); fi
+
+    echo "Applying policy class ${class} to ${target}"
+    kopia_admin "${args[@]}"
+}
+
+for row in "${SOURCES[@]}"; do
+    IFS=$'\t' read -r kind path class dev <<<"${row}"
+    case "${kind}" in
+        root)
+            apply_policy "${class}" "${BACKUP_USER}:/" "${GENERIC_EXCLUDES}" "${ROOT_EXCLUDES}" ;;
+        volume)
+            echo "Custom volume: device=${dev} path=${path}"
+            apply_policy "${class}" "${BACKUP_USER}:${path}" "${GENERIC_EXCLUDES}" "${DATA_EXCLUDES}" ;;
+    esac
+done
+
+echo
+echo "Provisioned ${INSTANCE}:"
+echo "  identity:   ${BACKUP_USER}"
+echo "  credential: ${BACKUP_PASSWORD_FILE}"
+for row in "${SOURCES[@]}"; do
+    IFS=$'\t' read -r kind path class dev <<<"${row}"
+    echo "  source:     ${path}  class=${class}"
+done
+echo "Next: incus-backup-container ${INSTANCE}"

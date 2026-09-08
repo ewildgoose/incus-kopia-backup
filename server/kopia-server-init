@@ -1,0 +1,90 @@
+#!/bin/bash
+# kopia-server-init [--dry-run]
+#
+# Idempotent hardening of the repository for untrusted backup clients.
+# Run once after creating the repository, and again after upgrading Kopia.
+#
+# 1. Wildcard ACLs (*@*): clients may append content, append snapshots for
+#    their own identity, and read the global, host and their own policies.
+#    They cannot delete anything or change any policy. Kopia's defaults grant
+#    FULL access to own snapshots, policies and user record; those are removed.
+# 2. Global policy: oneFileSystem=true (root snapshots stay out of mounted
+#    volumes), ignoreCacheDirs=false (a guest cannot hide a directory with a
+#    CACHEDIR.TAG file), no dot-ignore files, and noParent=true so Kopia's
+#    built-in default (.kopiaignore) cannot be merged back in.
+# Afterwards: rc-service kopia-server reload
+set -euo pipefail
+DRY=false
+[[ "${1:-}" == --dry-run ]] && DRY=true
+run() { echo "+ $*"; if [[ "${DRY}" == false ]]; then "$@"; fi; }
+norm() { tr ',' '\n' <<<"$1" | sort | paste -sd, -; }
+
+echo "== Wildcard ACLs for backup clients (*@*)"
+declare -A WANT=()
+while IFS=$'\t' read -r access target; do
+    WANT["$(norm "${target}")"]="${access}"
+done <<'WANTED'
+APPEND	type=content
+READ	type=policy,policyType=global
+READ	type=policy,policyType=host,hostname=OWN_HOST
+READ	type=policy,username=OWN_USER,hostname=OWN_HOST
+APPEND	type=snapshot,username=OWN_USER,hostname=OWN_HOST
+WANTED
+
+declare -A HAVE=()
+while IFS= read -r line; do
+    [[ "${line}" =~ ^id:([^[:space:]]+)[[:space:]]+user:([^[:space:]]+)[[:space:]]+access:([^[:space:]]+)[[:space:]]+target:(.*)$ ]] || continue
+    id="${BASH_REMATCH[1]}" user="${BASH_REMATCH[2]}" access="${BASH_REMATCH[3]}" target="$(norm "${BASH_REMATCH[4]}")"
+    if [[ "${user}" != '*@*' ]]; then
+        echo "keeping entry for ${user}: ${access} ${target}"
+        continue
+    fi
+    HAVE["${target}"]="${id} ${access}"
+done < <(kopia-admin server acl list)
+
+for target in "${!WANT[@]}"; do
+    want="${WANT[${target}]}"
+    have="${HAVE[${target}]:-}"
+    if [[ "${have#* }" == "${want}" ]]; then
+        echo "ok: *@* ${want} ${target}"
+        continue
+    fi
+    run kopia-admin server acl add --user='*@*' --access="${want}" --target="${target}" --overwrite
+done
+for target in "${!HAVE[@]}"; do
+    [[ -n "${WANT[${target}]:-}" ]] && continue
+    entry="${HAVE[${target}]}"
+    echo "removing *@* ${entry#* } ${target}"
+    run kopia-admin server acl delete "${entry%% *}" --delete
+done
+
+echo
+echo "== Global policy"
+current="$(kopia-admin policy export --global)"
+for section in retention errorHandling compression metadataCompression logging upload; do
+    if [[ "$(jq -r --arg s "${section}" '."(global)"[$s] // empty | length' <<<"${current}")" == "" ]]; then
+        echo "The global policy has no '${section}' section. With noParent=true nothing" >&2
+        echo "would be inherited for it. Define it (kopia-admin policy set --global ...) first." >&2
+        exit 1
+    fi
+done
+patched="$(jq '."(global)" |= (
+      .files.oneFileSystem = true
+    | .files.ignoreCacheDirs = false
+    | del(.files.ignoreDotFiles)
+    | .files.noParentDotFiles = true
+    | .noParent = true )' <<<"${current}")"
+if [[ "$(jq -S . <<<"${current}")" == "$(jq -S . <<<"${patched}")" ]]; then
+    echo "ok: global policy already hardened"
+else
+    echo "changing global policy files section to:"
+    jq '."(global)" | {files, noParent}' <<<"${patched}"
+    if [[ "${DRY}" == false ]]; then
+        printf '%s\n' "${patched}" | kopia-admin policy import --global
+    fi
+fi
+echo
+echo "Effective global policy:"
+kopia-admin policy show --global
+echo
+echo "Done. Apply on the running server: rc-service kopia-server reload"

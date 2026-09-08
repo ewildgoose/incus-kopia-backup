@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE pkgmetadata SYSTEM "https://www.gentoo.org/dtd/metadata.dtd">
+<pkgmetadata>
+	<maintainer type="person">
+		<email>ewildgoose@gmail.com</email>
+		<name>Ed Wildgoose</name>
+	</maintainer>
+	<use>
+		<flag name="client">Install the container-host tools (provision, worker, scheduler, status, shell)</flag>
+		<flag name="server">Install the Kopia repository server service and administration helpers</flag>
+	</use>
+</pkgmetadata>

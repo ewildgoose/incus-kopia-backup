@@ -1,0 +1,8 @@
+#!/bin/bash
+# kopia-server-fingerprint [CERT-FILE]
+# Print the SHA-256 fingerprint of the server TLS certificate in the form the
+# clients need for KOPIA_SERVER_FINGERPRINT (64 lowercase hex characters).
+set -euo pipefail
+CERT="${1:-${KOPIA_TLS_CERT:-/etc/kopia/server.crt}}"
+[[ -r "${CERT}" ]] || { echo "cannot read ${CERT}" >&2; exit 1; }
+openssl x509 -in "${CERT}" -noout -fingerprint -sha256 | sed 's/^.*=//; s/://g' | tr 'A-F' 'a-f'

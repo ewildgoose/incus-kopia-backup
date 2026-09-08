@@ -1,0 +1,4 @@
+# kopia-server helpers. Pin the guarded history first, then expire snapshots.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+23 3 * * * root /usr/sbin/kopia-pin-guard >>/var/log/kopia/pin-guard.log 2>&1
+53 3 * * * root /usr/sbin/kopia-expire-snapshots >>/var/log/kopia/expire.log 2>&1

@@ -1,0 +1,45 @@
+#!/bin/bash
+# kopia-server-add-host [--reset-password] HOST-FQDN
+#
+# Create (or update) the trusted-host administrative identity admin@HOST-FQDN
+# used by incus-backup-provision on that Incus/LXD host, and grant it:
+#   FULL  type=user      create backup users and set their passwords
+#   FULL  type=policy    write per-source policies (exclusions, retention)
+#   READ  type=snapshot  read snapshot lists for incus-backup-status --server
+# It gets no write access to snapshots or content beyond a normal client.
+# The generated password is printed once; store it on the host as
+# /etc/incus-backup/admin.password (mode 0600). Re-run to refresh the ACLs;
+# use --reset-password to rotate the password.
+set -euo pipefail
+RESET=false
+if [[ "${1:-}" == --reset-password ]]; then RESET=true; shift; fi
+HOST="${1:?Usage: $0 [--reset-password] <host-fqdn>}"
+HOST="${HOST,,}"
+[[ "${HOST}" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] || { echo "invalid host name '${HOST}'" >&2; exit 1; }
+ADMIN="admin@${HOST}"
+
+EXISTS=false
+if kopia-admin server users info "${ADMIN}" >/dev/null 2>&1; then EXISTS=true; fi
+
+if [[ "${EXISTS}" == false || "${RESET}" == true ]]; then
+    PASSWORD="$(openssl rand -base64 48 | tr -d '\n')"
+    if [[ "${EXISTS}" == true ]]; then
+        echo "Rotating password of ${ADMIN}"
+        kopia-admin server users set "${ADMIN}" --user-password="${PASSWORD}"
+    else
+        echo "Creating ${ADMIN}"
+        kopia-admin server users add "${ADMIN}" --user-password="${PASSWORD}"
+    fi
+    echo
+    echo "Password for ${ADMIN}. Store it on ${HOST} in /etc/incus-backup/admin.password (mode 0600):"
+    echo "${PASSWORD}"
+    echo
+else
+    echo "${ADMIN} exists; password unchanged (use --reset-password to rotate)"
+fi
+
+kopia-admin server acl add --user="${ADMIN}" --access=FULL --target=type=user --overwrite
+kopia-admin server acl add --user="${ADMIN}" --access=FULL --target=type=policy --overwrite
+kopia-admin server acl add --user="${ADMIN}" --access=READ --target=type=snapshot --overwrite
+echo "ACLs for ${ADMIN} are in place."
+echo "Make the running server see this now: rc-service kopia-server reload"

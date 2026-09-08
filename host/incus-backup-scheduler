@@ -1,0 +1,91 @@
+#!/bin/bash
+# incus-backup-scheduler
+#
+# Start backups that are due. Run from cron every 10-15 minutes. Only one
+# scheduler runs at a time; a second invocation exits immediately.
+#
+# An instance is due when it is running, has user.backup.enabled=true, and the
+# time since its last complete success is at least user.backup.interval
+# (default DEFAULT_INTERVAL). The most overdue instance starts first. Up to
+# MAX_JOBS workers run at once; no worker starts while the normalized load is
+# at or above MAX_NORMALIZED_LOAD.
+#
+# Failures are printed to stdout (cron mails them) and logged to
+# LOG_DIR/scheduler.log. Requires bash 5.1 or later (wait -p).
+set -euo pipefail
+# shellcheck source=lib/common.sh
+source /usr/lib/incus-backup/common.sh
+ib_load_config
+ib_detect_cli
+
+WORKER="$(dirname "$(readlink -f "$0")")/incus-backup-container"
+[[ -x "${WORKER}" ]] || ib_die "${WORKER} not found"
+
+install -d -m 0755 "${LOCK_DIR}"
+install -d -m 0750 "${STATE_DIR}" "${LOG_DIR}"
+exec 9>"${LOCK_DIR}/scheduler.lock"
+flock -n 9 || exit 0
+
+SLOG="${LOG_DIR}/scheduler.log"
+log() { printf '%s scheduler: %s\n' "$(date -Is)" "$*" >>"${SLOG}"; }
+NOW="$(date +%s)"
+
+mapfile -t CANDIDATES < <("${CLI}" query "/1.0/instances?recursion=1" | jq -r '
+    .[]
+    | select(.status == "Running")
+    | select(((.expanded_config["user.backup.enabled"] // "") | ascii_downcase) | IN("1", "true", "yes", "on"))
+    | [.name, (.expanded_config["user.backup.interval"] // "")]
+    | @tsv')
+
+declare -a DUE=()
+for row in "${CANDIDATES[@]}"; do
+    IFS=$'\t' read -r name interval <<<"${row}"
+    [[ -n "${interval}" ]] || interval="${DEFAULT_INTERVAL}"
+    if ! secs="$(ib_interval_seconds "${interval}")"; then
+        log "${name}: invalid user.backup.interval '${interval}'; skipping"
+        continue
+    fi
+    last=0
+    [[ -r "${STATE_DIR}/${name}/last_success" ]] && last="$(<"${STATE_DIR}/${name}/last_success")"
+    [[ "${last}" =~ ^[0-9]+$ ]] || last=0
+    (( NOW - last >= secs )) || continue
+    DUE+=("${last}"$'\t'"${name}")
+done
+(( ${#DUE[@]} > 0 )) || exit 0
+mapfile -t DUE < <(printf '%s\n' "${DUE[@]}" | sort -n)
+
+declare -A JOB_NAME=()
+declare -a FAILED=()
+
+reap() {
+    local pid="" rc=0 name
+    if wait -n -p pid; then rc=0; else rc=$?; fi
+    [[ -n "${pid}" ]] || { JOB_NAME=(); return; }
+    name="${JOB_NAME[${pid}]:-unknown}"
+    unset "JOB_NAME[${pid}]"
+    if (( rc == 0 )); then
+        log "${name}: finished ok"
+    else
+        log "${name}: FAILED rc=${rc}; see ${LOG_DIR}/${name}.log"
+        FAILED+=("${name}")
+    fi
+}
+
+for row in "${DUE[@]}"; do
+    IFS=$'\t' read -r last name <<<"${row}"
+    while (( ${#JOB_NAME[@]} >= MAX_JOBS )); do reap; done
+    if ib_load_too_high; then
+        log "normalized load ${IB_LOAD} >= ${MAX_NORMALIZED_LOAD}; deferring ${name} and later instances"
+        break
+    fi
+    if (( last > 0 )); then since="$(date -Is -d "@${last}")"; else since=never; fi
+    log "${name}: starting (last success ${since})"
+    "${WORKER}" "${name}" >/dev/null 2>&1 &
+    JOB_NAME[$!]="${name}"
+done
+while (( ${#JOB_NAME[@]} > 0 )); do reap; done
+
+if (( ${#FAILED[@]} > 0 )); then
+    printf 'incus-backup on %s: FAILED: %s (see %s/<instance>.log)\n' "$(hostname -f 2>/dev/null || hostname)" "${FAILED[*]}" "${LOG_DIR}"
+    exit 1
+fi

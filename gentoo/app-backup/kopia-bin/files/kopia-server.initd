@@ -1,0 +1,89 @@
+#!/sbin/openrc-run
+
+description="Kopia repository server"
+extra_started_commands="reload"
+description_reload="Re-read users, ACLs and policies from the repository now (SIGHUP)"
+
+command="/usr/bin/kopia"
+command_background="yes"
+
+pidfile="/run/${RC_SVCNAME}.pid"
+
+output_log="${KOPIA_LOG_FILE:-/var/log/${RC_SVCNAME}.log}"
+error_log="${KOPIA_LOG_FILE:-/var/log/${RC_SVCNAME}.log}"
+
+depend() {
+	need localmount
+	need net
+}
+
+start_pre() {
+	if [ -z "${KOPIA_CONFIG_FILE}" ]; then
+		eerror "KOPIA_CONFIG_FILE is not configured"
+		return 1
+	fi
+
+	if [ ! -r "${KOPIA_CONFIG_FILE}" ]; then
+		eerror "Cannot read Kopia config: ${KOPIA_CONFIG_FILE}"
+		return 1
+	fi
+
+	if [ -z "${KOPIA_PASSWORD_FILE}" ]; then
+		eerror "KOPIA_PASSWORD_FILE is not configured"
+		return 1
+	fi
+
+	if [ ! -r "${KOPIA_PASSWORD_FILE}" ]; then
+		eerror "Cannot read repository password: ${KOPIA_PASSWORD_FILE}"
+		return 1
+	fi
+
+	if [ -z "${KOPIA_SERVER_CONTROL_PASSWORD_FILE}" ]; then
+		eerror "KOPIA_SERVER_CONTROL_PASSWORD_FILE is not configured"
+		return 1
+	fi
+
+	if [ ! -r "${KOPIA_SERVER_CONTROL_PASSWORD_FILE}" ]; then
+		eerror "Cannot read server control password: ${KOPIA_SERVER_CONTROL_PASSWORD_FILE}"
+		return 1
+	fi
+
+	if [ -z "${KOPIA_TLS_CERT_FILE}" ] || [ ! -r "${KOPIA_TLS_CERT_FILE}" ]; then
+		eerror "Cannot read TLS certificate: ${KOPIA_TLS_CERT_FILE}"
+		return 1
+	fi
+
+	if [ -z "${KOPIA_TLS_KEY_FILE}" ] || [ ! -r "${KOPIA_TLS_KEY_FILE}" ]; then
+		eerror "Cannot read TLS key: ${KOPIA_TLS_KEY_FILE}"
+		return 1
+	fi
+
+	checkpath -d -m 0700 "$(dirname "${output_log}")"
+
+	if [ -n "${KOPIA_LOG_DIR}" ]; then
+		checkpath -d -m 0750 "${KOPIA_LOG_DIR}" || return 1
+	fi
+
+	export KOPIA_PASSWORD
+	KOPIA_PASSWORD=$(cat "${KOPIA_PASSWORD_FILE}") || return 1
+
+	export KOPIA_SERVER_CONTROL_PASSWORD
+	KOPIA_SERVER_CONTROL_PASSWORD=$(cat "${KOPIA_SERVER_CONTROL_PASSWORD_FILE}") || return 1
+}
+
+reload() {
+	ebegin "Reloading ${RC_SVCNAME}"
+	start-stop-daemon --signal HUP --pidfile "${pidfile}"
+	eend $?
+}
+
+command_args="
+	--config-file=${KOPIA_CONFIG_FILE}
+	${KOPIA_LOG_DIR:+--log-dir=${KOPIA_LOG_DIR}}
+	server start
+	--address=${KOPIA_LISTEN_ADDRESS}
+	--tls-cert-file=${KOPIA_TLS_CERT_FILE}
+	--tls-key-file=${KOPIA_TLS_KEY_FILE}
+	--server-control-username=${KOPIA_SERVER_CONTROL_USERNAME}
+	${KOPIA_SERVER_OPTIONS}
+"

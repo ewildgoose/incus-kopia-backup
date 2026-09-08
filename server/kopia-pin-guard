@@ -1,0 +1,84 @@
+#!/bin/bash
+# kopia-pin-guard [--dry-run]
+#
+# Protect backup history from clients that manipulate retention. A client with
+# APPEND access can ask the server to apply retention to its own source, and it
+# can forge snapshot timestamps, so retention alone does not make history
+# immutable. Kopia never expires a pinned snapshot, and only the administrator
+# can pin, so this job maintains administrator pins:
+#   guard-daily    newest snapshot of each of the last GUARD_DAILY days
+#   guard-weekly   newest snapshot of each of the last GUARD_WEEKLY ISO weeks
+#   guard-monthly  newest snapshot of each of the last GUARD_MONTHLY months
+#   guard-annual   newest snapshot of each of the last GUARD_ANNUAL years
+# Buckets are counted over the snapshots that exist, newest first. Guard pins
+# that no longer qualify are removed. Settings: /etc/kopia/pin-guard.conf.
+# Run daily from cron before kopia-expire-snapshots.
+set -euo pipefail
+
+CONF="${PIN_GUARD_CONF:-/etc/kopia/pin-guard.conf}"
+GUARD_DAILY=7 GUARD_WEEKLY=8 GUARD_MONTHLY=12 GUARD_ANNUAL=3
+# shellcheck disable=SC1090
+[[ -r "${CONF}" ]] && source "${CONF}"
+DRY=false
+[[ "${1:-}" == --dry-run ]] && DRY=true
+for v in GUARD_DAILY GUARD_WEEKLY GUARD_MONTHLY GUARD_ANNUAL; do
+    [[ "${!v}" =~ ^[0-9]+$ ]] || { echo "${v} must be a number" >&2; exit 1; }
+done
+
+# shellcheck disable=SC2016
+JQ_PROGRAM='
+def epoch: .startTime | sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601;
+def guards: [
+    {name: "guard-daily",   fmt: "%Y-%m-%d", n: $daily},
+    {name: "guard-weekly",  fmt: "%G-%V",    n: $weekly},
+    {name: "guard-monthly", fmt: "%Y-%m",    n: $monthly},
+    {name: "guard-annual",  fmt: "%Y",       n: $annual}
+] | map(select(.n > 0));
+# newest snapshot of each of the n newest buckets ($snaps sorted newest first)
+def pick($snaps; $fmt; $n):
+    reduce $snaps[] as $s ({seen: [], ids: []};
+        ($s.t | strftime($fmt)) as $k
+        | if (.seen | index($k)) != null then .
+          elif (.seen | length) < $n then .seen += [$k] | .ids += [$s.id]
+          else . end)
+    | .ids;
+[ .[]
+  | select((.incomplete // "") == "")
+  | {id, pins: (.pins // []), t: epoch,
+     src: (.source | "\(.userName)@\(.host):\(.path)")} ]
+| group_by(.src)
+| map( (sort_by(.t) | reverse) as $snaps
+       | guards[] as $g
+       | pick($snaps; $g.fmt; $g.n) as $want
+       | $snaps[]
+       | (.id | IN($want[])) as $w
+       | ((.pins | index($g.name)) != null) as $h
+       | if $w and ($h | not) then ["add", $g.name, .id, .src]
+         elif $h and ($w | not) then ["remove", $g.name, .id, .src]
+         else empty end )
+| .[] | @tsv
+'
+
+LIST="${PIN_GUARD_INPUT:-}"
+if [[ -n "${LIST}" ]]; then
+    ACTIONS="$(jq -r --argjson daily "${GUARD_DAILY}" --argjson weekly "${GUARD_WEEKLY}" \
+        --argjson monthly "${GUARD_MONTHLY}" --argjson annual "${GUARD_ANNUAL}" "${JQ_PROGRAM}" "${LIST}")"
+else
+    ACTIONS="$(kopia-admin snapshot list --all --json --no-retention \
+        | jq -r --argjson daily "${GUARD_DAILY}" --argjson weekly "${GUARD_WEEKLY}" \
+            --argjson monthly "${GUARD_MONTHLY}" --argjson annual "${GUARD_ANNUAL}" "${JQ_PROGRAM}")"
+fi
+
+changes=0
+for op in add remove; do
+    for pin in guard-daily guard-weekly guard-monthly guard-annual; do
+        mapfile -t ids < <(awk -F'\t' -v o="${op}" -v p="${pin}" '$1 == o && $2 == p { print $3 }' <<<"${ACTIONS}")
+        (( ${#ids[@]} > 0 )) || continue
+        changes=$(( changes + ${#ids[@]} ))
+        awk -F'\t' -v o="${op}" -v p="${pin}" '$1 == o && $2 == p { printf "%s %s %s (%s)\n", o, p, $3, $4 }' <<<"${ACTIONS}"
+        if [[ "${DRY}" == false && -z "${LIST}" ]]; then
+            kopia-admin snapshot pin "${ids[@]}" "--${op}=${pin}"
+        fi
+    done
+done
+echo "$(date -Is) kopia-pin-guard: ${changes} pin change(s)$( [[ "${DRY}" == true ]] && echo ' (dry run)')"

@@ -1,0 +1,43 @@
+# Generic Kopia repository server configuration.
+#
+# For multiple repositories use an OpenRC multiplexed service:
+#
+#   ln -s kopia-server /etc/init.d/kopia-server.backup
+#   cp /etc/conf.d/kopia-server /etc/conf.d/kopia-server.backup
+#
+# OpenRC will load this file first and then the instance-specific conf.d file.
+
+# Kopia repository connection configuration.
+KOPIA_CONFIG_FILE="/etc/kopia/repository.config"
+
+# File containing only the Kopia repository encryption password.
+# Must be readable only by root.
+KOPIA_PASSWORD_FILE="/etc/kopia/repository.password"
+
+# Server control API credentials.
+KOPIA_SERVER_CONTROL_USERNAME="server-control"
+KOPIA_SERVER_CONTROL_PASSWORD_FILE="/etc/kopia/server-control.password"
+
+# Persistent TLS identity.
+KOPIA_TLS_CERT_FILE="/etc/kopia/server.crt"
+KOPIA_TLS_KEY_FILE="/etc/kopia/server.key"
+
+# Listen address. Use 0.0.0.0:51515 to serve backup clients on the network.
+KOPIA_LISTEN_ADDRESS="127.0.0.1:51515"
+
+# Service stdout/stderr.
+KOPIA_LOG_FILE="/var/log/kopia-server.log"
+
+# Directory for Kopia's own log files. Empty = Kopia default (~/.cache/kopia).
+KOPIA_LOG_DIR=""
+
+# Additional arguments passed to "kopia server start".
+#
+# --refresh-interval sets how often the server re-reads users, ACLs and
+# policies written by other clients (Kopia default: 4h).
+# "rc-service kopia-server reload" forces an immediate re-read.
+# --no-ui disables the web UI; API clients do not need it.
+#
+# Example:
+# KOPIA_SERVER_OPTIONS="--no-ui --refresh-interval=1m"
+KOPIA_SERVER_OPTIONS=""
