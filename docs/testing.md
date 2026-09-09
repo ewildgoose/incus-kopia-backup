@@ -1,7 +1,7 @@
 # Acceptance tests
 
 Run these after the first installation and after upgrading Kopia. Test
-container: `dr-test-xfs` on `cl1`, identity `backup@dr-test-xfs.nippynetworks.com`.
+container: `dr-test-xfs` on `cl1`, identity `backup@dr-test-xfs.nippynetworks.lan`.
 Every command block states where it runs.
 
 ## T1. Server is listening (media)
@@ -33,7 +33,7 @@ directories not ignored, no dot-ignore files.
 
 ```bash
 incus config set dr-test-xfs user.backup.enabled=true
-incus config set dr-test-xfs user.backup.hostname=dr-test-xfs.nippynetworks.com
+incus config set dr-test-xfs user.backup.hostname=dr-test-xfs.nippynetworks.lan
 incus config set dr-test-xfs user.backup.interval=6h
 incus-backup-provision dr-test-xfs
 incus-backup-container dr-test-xfs
@@ -51,12 +51,12 @@ guest only needs `sh`.
 ```bash
 S='incus-backup-shell dr-test-xfs'
 $S kopia snapshot list && echo LIST-OK
-$S kopia policy show 'backup@dr-test-xfs.nippynetworks.com:/'
+$S kopia policy show 'backup@dr-test-xfs.nippynetworks.lan:/'
 ID=$($S kopia snapshot list --json | jq -r '.[0].id')
 $S kopia snapshot delete "$ID" --delete && echo DELETE-ALLOWED-BAD
 $S kopia policy set --global --keep-latest=1 && echo GLOBAL-POLICY-ALLOWED-BAD
 $S kopia policy set / --keep-latest=1 && echo PATH-POLICY-ALLOWED-BAD
-$S kopia snapshot list --all --json | jq -e '[.[] | select(.source.host != "dr-test-xfs.nippynetworks.com")] | length > 0' >/dev/null && echo OTHER-HOSTS-VISIBLE-BAD
+$S kopia snapshot list --all --json | jq -e '[.[] | select(.source.host != "dr-test-xfs.nippynetworks.lan")] | length > 0' >/dev/null && echo OTHER-HOSTS-VISIBLE-BAD
 ```
 
 Expected: `LIST-OK`; the policy shows the `root-server` ignore rules as
@@ -74,7 +74,7 @@ incus-backup-container dr-test-xfs
 ```
 
 Expected: provisioning prints `Custom volume: device=data path=/srv/data` and
-applies class `data` to `backup@dr-test-xfs.nippynetworks.com:/srv/data`; the
+applies class `data` to `backup@dr-test-xfs.nippynetworks.lan:/srv/data`; the
 backup snapshots `/` and `/srv/data`. Then check that root did not descend
 into the volume:
 
@@ -102,8 +102,10 @@ echo "--- var/cache (class rule):"; $S kopia ls "$R/var/cache/"
 echo "--- srv (ad-hoc rule):";      $S kopia ls "$R/srv/"
 ```
 
-Expected: `/var/cache/` is empty in the snapshot and `scratch` is absent
-from `/srv/`.
+Expected: the provisioning output shows one `adding "..." to "ignore rules"`
+line per pattern after the `removing all` line; `kopia ls` reports that
+`var/cache` is not found in the snapshot, because the directory itself is
+excluded; `scratch` is absent from `/srv/`.
 
 ## T7. A guest cannot exclude its own files (cl1)
 
@@ -115,7 +117,7 @@ Part 1: the effective policy of the source must list no dot-ignore files and
 must not ignore cache directories. From the guest's own view:
 
 ```bash
-incus-backup-shell dr-test-xfs kopia policy show 'backup@dr-test-xfs.nippynetworks.com:/' --json | jq '{files: .files, noParent: .noParent}'
+incus-backup-shell dr-test-xfs kopia policy show 'backup@dr-test-xfs.nippynetworks.lan:/' --json | jq '{files: .files, noParent: .noParent}'
 ```
 
 Expected: `.files` has no `ignoreDotFiles` key, `ignoreCacheDirs` is false,

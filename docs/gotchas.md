@@ -23,6 +23,11 @@ after a Kopia upgrade.
   `policy export --global | jq | policy import --global` because the CLI has
   no flag for `ignoreDotFiles=none`; `policy set --inherit=false` sets
   `noParent` but does not clear the list.
+- **`--clear-ignore` and `--add-ignore` in one `policy set` call: the adds
+  are lost.** The clear returns early, and the same holds for the dot-ignore
+  pair. The symptom is a `removing all from "ignore rules"` line with no
+  `adding` lines. Clear in one call, add in the next; `incus-backup-provision`
+  does this.
 - **`ignoreCacheDirs` defaults to true.** Any directory with a `CACHEDIR.TAG`
   file carrying the standard signature is skipped. A guest can hide `/etc`
   that way. Every class file and the global policy set it to false.
@@ -107,4 +112,5 @@ after a Kopia upgrade.
   the run is marked failed and `last_success` does not advance.
 - **The scheduler needs bash 5.1** (`wait -n -p`). Gentoo has 5.2 or later.
 - **`hostname -f` decides `KOPIA_ADMIN_HOSTNAME`** unless set explicitly.
-  The value must equal the FQDN given to `kopia-server-add-host`.
+  Beware it can select the first entry from `/etc/hosts`
+  eg on the link with 127.0.0.1

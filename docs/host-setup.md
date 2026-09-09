@@ -31,12 +31,20 @@ Edit `/etc/incus-backup.conf`:
 ```text
 KOPIA_SERVER_URL          https://kopia.nippynetworks.lan:51515
 KOPIA_SERVER_FINGERPRINT  output of kopia-server-fingerprint on media
-KOPIA_ADMIN_HOSTNAME      defaults to hostname -f; set it if that is not the FQDN
-                          you gave to kopia-server-add-host
+KOPIA_ADMIN_HOSTNAME      the FQDN you gave to kopia-server-add-host, for
+                          example cl1.nippynetworks.com
 ```
 
-The other values have working defaults. The file is under CONFIG_PROTECT, so
-package updates do not overwrite it.
+The default `KOPIA_ADMIN_HOSTNAME` uses `hostname -f`, which
+derives it from the first entry on the 127.0.0.1 line. Use eg:
+
+```text
+127.0.0.1     cl1.nippynetworks.lan cl1 localhost
+```
+
+```bash
+rm -f /usr/local/sbin/incus-backup-* && hash -r && type incus-backup-provision
+```
 
 ## 3. Admin identity
 

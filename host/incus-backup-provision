@@ -130,7 +130,10 @@ apply_policy() {
     # shellcheck disable=SC1090
     source "${POLICY_DIR}/${class}.conf"
 
-    local args=(policy set "${target}" --clear-ignore --clear-dot-ignore)
+    # Kopia discards --add-ignore given in the same call as --clear-ignore
+    # (applyPolicyStringList returns after clearing), so the list is cleared in
+    # one call below and filled in a second one.
+    local args=(policy set "${target}")
     for p in "${IGNORE[@]}"; do args+=(--add-ignore "${p}"); done
     for extra in "$@"; do
         while IFS= read -r p; do args+=(--add-ignore "${p}"); done < <(split_list "${extra}")
@@ -146,7 +149,10 @@ apply_policy() {
     if [[ -n "${COMPRESSION}" ]]; then args+=(--compression="${COMPRESSION}"); fi
 
     echo "Applying policy class ${class} to ${target}"
-    kopia_admin "${args[@]}"
+    kopia_admin policy set "${target}" --clear-ignore --clear-dot-ignore
+    if (( ${#args[@]} > 3 )); then
+        kopia_admin "${args[@]}"
+    fi
 }
 
 for row in "${SOURCES[@]}"; do

@@ -40,6 +40,9 @@ ib_load_config() {
     [[ "${KOPIA_SERVER_FINGERPRINT}" =~ ^[0-9a-fA-F]{64}$ ]] \
         || ib_die "KOPIA_SERVER_FINGERPRINT in ${IB_CONFIG_FILE} must be a 64-character hex SHA-256 fingerprint"
     [[ -x "${KOPIA_BIN}" ]] || ib_die "${KOPIA_BIN} is not executable"
+    KOPIA_ADMIN_HOSTNAME="${KOPIA_ADMIN_HOSTNAME,,}"
+    [[ "${KOPIA_ADMIN_HOSTNAME}" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ && "${KOPIA_ADMIN_HOSTNAME}" != localhost.* ]] \
+        || ib_die "KOPIA_ADMIN_HOSTNAME='${KOPIA_ADMIN_HOSTNAME}' is not an FQDN; set it explicitly in ${IB_CONFIG_FILE} (hostname -f gave a bad answer)"
 
     # Host-side kopia invocations log here instead of /root/.cache/kopia.
     export KOPIA_LOG_DIR="${LOG_DIR}/kopia"
